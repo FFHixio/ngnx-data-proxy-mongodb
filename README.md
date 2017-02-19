@@ -1,9 +1,9 @@
-# NGNX.DATA.MongoProxy
+# NGNX.DATA.MongoDBProxy
 
-`npm i ngnx-data-proxy-mongo`
+`npm i ngnx-data-proxy-mongodb`
 
 ```js
-require('ngnx-data-proxy-mongo')
+require('ngnx-data-proxy-mongodb')
 
 const Person = new NGN.DATA.Model({
   fields: {
@@ -11,7 +11,7 @@ const Person = new NGN.DATA.Model({
     lastname: null
   },
 
-  proxy: new NGNX.DATA.MongoProxy({
+  proxy: new NGNX.DATA.MongoDBProxy({
     host: 'host.com:12345',
     database: 'people_db',
     username: 'user',
@@ -20,5 +20,4 @@ const Person = new NGN.DATA.Model({
 })
 ```
 
-The MongoDB proxy is used to perform CRUD operations from an NGN.DATA.Store and/or
-NGN.DATA.Model.  
+The MongoDB proxy is used to perform CRUD operations from an NGN.DATA.Store and/or NGN.DATA.Model.  

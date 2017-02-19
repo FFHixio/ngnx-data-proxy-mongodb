@@ -1,0 +1,9 @@
+.*
+!.gitignore
+!.npmignore
+_*
+node_modules
+test/data
+*.log
+env.json
+

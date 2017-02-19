@@ -1,0 +1,9 @@
+_*
+*.md
+.*
+*.log
+*.yml
+*.sh
+examples
+test
+env.json

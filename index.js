@@ -59,6 +59,28 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
       _collection: NGN.private(cfg.collection || 'unknown'),
 
       /**
+       * @cfg {boolean} [expandRelationships=false]
+       * When `true`, any relationship datafields will be saved/fetched
+       * from their own collection.
+       *
+       * For example:
+       *
+       * ```
+       * let MyModel = new NGNX.DATA.Model({
+       *   fields: {...},
+       *   relationships: {
+       *     anothercollection: SubModel
+       *   }
+       * })
+       * ```
+       *
+       * When `MyModel` is persisted, it will attempt to upsert
+       * a record in the `anothercollection` collection, using
+       * the data from `SubModel` as it's value.
+       */
+      expandRelationships: NGN.private(NGN.coalesce(cfg.expandRelationships, false)),
+
+      /**
        * @cfg {string} [host=localhost]
        * The host can be just the server name/URI or the URI+Port. For example,
        * `myserver.com` and `myserver.com:12345` are both valid.
@@ -142,7 +164,15 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
 
       _heartbeat: NGN.private(null),
 
-      _livetrack: NGN.private([])
+      _livetrack: NGN.private([]),
+
+      /**
+       * @cfg {boolean} [fieldAsRecord=false]
+       * When set to `true`, each field will be saved as it's own key/value
+       * record in the Mongo collection.
+       * @info This only applicable to NGN.DATA.Model proxies. Stores ignore this.
+       */
+      fieldAsRecord: NGN.privateconst(NGN.coalesce(cfg.fieldAsRecord, false))
     })
 
     this.heartbeatInterval = this.heartbeatInterval < 100 ? 9000 : this.heartbeatInterval
@@ -254,6 +284,11 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
       }
 
       this.store.replaceModel(MongoModel)
+    } else if (!this.fieldAsRecord) {
+      if (!this.store.has('__mongoid')) {
+        console.log('INIT SPECIAL', this.type)
+        this.store.addMetaField('__mongoid')
+      }
     }
   }
 
@@ -279,7 +314,7 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
     }
 
     this.client.connect(this._connstring, {
-      auto_reconnect: this.autoreconnect
+      autoReconnect: this.autoreconnect
     }, (err, db) => {
       if (err) {
         throw err
@@ -353,18 +388,170 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    * Returns true if it's safe continue the save operation.
    * @private
    */
-   presave (callback) {
-     // If there is no connection, attempt to establish one.
-     if (!this.connected) {
-       this.preconnect(() => {
-         this.save.apply(this, arguments)
-       })
+  presave (callback) {
+    // If there is no connection, attempt to establish one.
+    if (!this.connected) {
+      this.preconnect(() => {
+        this.save.apply(this, arguments)
+      })
 
-       return false
-     }
+      return false
+    }
 
-     return true
-   }
+    return true
+  }
+
+  /**
+   * @method assureMongoId
+   * Makes sure a MongoDB ObjectId is assigned to a model
+   * as a metadata field called `__mongoid`.
+   * @param {NGN.DATA.Model} model
+   * The data model to check/update.
+   * @private
+   */
+  assureMongoId (model) {
+    if (model instanceof NGN.DATA.Store) {
+      console.warn('Cannot apply MongoID to a store.', model.data)
+      return
+    }
+
+    // Assure a Mongo ID is available
+    if (!model.hasMetaField('__mongoid')) {
+      model.addMetaField('__mongoid')
+    }
+
+    // If no ID exists, make one.
+    model.__mongoid = NGN.coalesce(model.__mongoid, this.createId())
+  }
+
+  /**
+   * @method appendQuery
+   * A helper method for appending query items to a bulk operation.
+   * @param {object} query
+   * The "main" query to add items to.
+   * @param {object} flattenedQuery
+   * The result of another flattened query
+   */
+  appendQuery (query, flattenedQuery) {
+    Object.keys(flattenedQuery).forEach((coll) => {
+      flattenedQuery[coll].forEach((result) => {
+        query[coll] = query[coll] || []
+        query[coll].push(result)
+      })
+    })
+  }
+
+  /**
+   * @method flattenModelQuery
+   * This is used to flatten nested models/stores (relationships) into
+   * an array of query items. This should not be used directly.
+   * @param {NGN.DATA.Model} model
+   * The model to flatten.
+   * @param {string} collection
+   * The collection to persist to.
+   * @param {function} callback
+   * A callback to execute when the operation is complete.
+   * This receives an error argument (`null` if no error occurred) and
+   * a query object. The query object looks like:
+   *
+   * ```js
+   * {
+   *   colletion_a: [{
+   *     updateOne: {
+   *       filter: {
+   *         _id: ObjectId('...')
+   *       },
+   *       update: {...},
+   *       upsert: true
+   *     }
+   *   }, {
+   *     updateOne: {
+   *       filter: {
+   *         _id:  ObjectId('...')
+   *       },
+   *       update: {...},
+   *       upsert: true
+   *     }
+   *   }],
+   *   colletion_b: [{
+   *     updateOne: {
+   *       filter: {
+   *         _id: ObjectId('...')
+   *       },
+   *       update: {...},
+   *       upsert: true
+   *     }
+   *   }]
+   * }
+   * ```
+   * The response from this method can be used in bulkWrite
+   * operations on the MongoDB.
+   * @prviate
+   */
+  flattenModelQuery(model, collection, callback) {
+    if (model instanceof NGN.DATA.Store) {
+      console.warn('Cannot flatten a store.')
+      return
+    }
+
+    let data = model.data
+
+    // Create a placeholder for results.
+    let query = {}
+
+    // Create an operations queue
+    let tasks = new TaskRunner()
+
+    // If the model has more relationships, expand them.
+    if (model.relationships.length > 0) {
+      // Flatten bulkWrite query for Mongo
+      model.relationships.forEach((field) => {
+        if (model[field] instanceof NGN.DATA.Store) {
+          data[field] = []
+          model[field].records.forEach((record) => {
+            if (!record.proxyignore) {
+              this.assureMongoId(record)
+
+              data[field].push(record.__mongoid)
+              // data[field].push(Object.defineProperty({}, field + '_id', NGN.public(record.__mongoid)))
+
+              tasks.add((next) => this.flattenModelQuery(record, field, (err, subquery) => {
+                this.appendQuery(query, subquery)
+                next()
+              }))
+            }
+          })
+        } else if (!model[field].proxyignore) {
+          this.assureMongoId(model[field])
+          data[field] = Object.defineProperty({}, field + '_id', NGN.public(model[field].__mongoid))
+
+          tasks.add((next) => this.flattenModelQuery(model[field], field, (err, subquery) => {
+            this.appendQuery(query, subquery)
+            next()
+          }))
+        }
+      })
+    }
+
+    tasks.add((next) => {
+      this.assureMongoId(model)
+      query[collection] = query[collection] || []
+      query[collection].push({
+        updateOne: {
+          filter: {
+            _id: model.__mongoid
+          },
+          update: data,
+          upsert: true
+        }
+      })
+
+      next()
+    })
+
+    tasks.on('complete', () => callback(null, query))
+    tasks.run(true)
+  }
 
   /**
    * @method save
@@ -398,16 +585,16 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
 
       // Assure each record has a MongoID
       this.store.records.forEach((record) => {
-        if (record.__mongoid === null) {
-          record.__mongoid = this.createId()
-        }
+        this.assureMongoId(record)
 
         tasks.add((next) => {
-          this.collection.updateOne({
-            _id: record.__mongoid
-          }, record.data, {
-            upsert: true
-          }).then(next)
+          this.flattenModelQuery(record, this._collection, (err, query) => {
+            Object.keys(query).forEach((coll) => {
+              this._db.collection(coll).bulkWrite(query[coll]).then(next).catch((e) => {
+                throw e
+              })
+            })
+          })
         })
       })
 
@@ -416,7 +603,7 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
         this.postsave(callback)
       })
 
-      tasks.run()
+      tasks.run(true)
     } else {
       // Ignore the save operation if nothing has changed.
       if (!this.store.isNew && !this.store.modified) {
@@ -428,32 +615,99 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
         return
       }
 
-      // Add each field as it's ownMongo record.
-      let tasks = new TaskRunner()
+      // If the fields should be a single record,
+      // save the entire model content as a single record.
+      if (!this.fieldAsRecord) {
+        this.assureMongoId(this.store)
+
+        let tasks = new TaskRunner()
+
+        // Expand nested fields if necessary
+        if (this.expandRelationships && this.store.relationships.length > 0) {
+          this.flattenModelQuery(this.store, this._collection, (err, query) => {
+// console.log('QUERY:', JSON.stringify(query, null, 2))
+            Object.keys(query).forEach((coll) => {
+              tasks.add((more) => {
+                this._db.collection(coll).bulkWrite(query[coll]).then(more).catch((e) => {
+                  throw e
+                })
+              })
+            })
+          })
+        } else {
+          tasks.add((next) => {
+            this.collection.updateOne({
+              _id: this.store.__mongoid
+            }, this.store.data, {
+              upsert: true
+            }).then(next).catch((e) => {
+              console.error(e)
+              next()
+            })
+          })
+        }
+
+        tasks.on('complete', () => this.postsave(callback))
+
+        return tasks.run(true)
+      }
+
+      // If configured to do do,
+      // Add each field as it's own MongoDB record.
+      let operations = []
 
       Object.keys(this.store.data).forEach((key) => {
-        tasks.add((next) => {
-          this.collection.bulkWrite([{
-            updateOne: {
-              filter: {
-                field: key
-              },
-              update: {
-                field: key,
-                value: this.store.data[key]
-              },
-              upsert: true
-            }
-          }]).then(next)
+        operations.push({
+          updateOne: {
+            filter: {
+              field: key
+            },
+            update: {
+              field: key,
+              value: this.store.data[key]
+            },
+            upsert: true
+          }
         })
       })
 
-      tasks.on('complete', () => {
-        this.postsave(callback)
-      })
+      if (operations.length === 0) {
+        return
+      }
 
-      tasks.run()
+      this.collection.bulkWrite(operations).then(() => this.postsave(callback))
     }
+  }
+
+  /**
+   * @method getModelCollections
+   * Retrieve all the nested relationship fields as a single
+   * deduplicated list of collections.
+   */
+  getModelCollections (model, prefix = null) {
+    let relationships = NGN.coalesce(model.relationships, [])
+
+    relationships.forEach((field) => {
+      if (model[field] instanceof NGN.DATA.Store) {
+        // Create a temporary new model instance from the store base model,
+        // allowing this method to parse the fields of the instantiated model.
+        let temp = new model[field].model()
+        relationships = relationships.concat(this.getModelCollections(temp, field))
+        temp = null
+      } else if (model[field] instanceof NGN.DATA.Entity || model[field] instanceof NGN.DATA.Model) {
+        relationships = relationships.concat(this.getModelCollections(model[field], field))
+      }
+    })
+
+    let response = NGN.dedupe(relationships)
+
+    if (prefix) {
+      response = response.map((field) => {
+        return `${prefix}.${field}`
+      })
+    }
+
+    return response
   }
 
   /**
@@ -488,7 +742,7 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    * Fired after the fetch and parse is complete.
    */
   fetch (filter, callback) {
-    if (typeof filter === 'function') {
+    if (NGN.isFn(filter)) {
       callback = filter
       filter = {}
     }
@@ -534,22 +788,69 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
         return
       }
 
-      // Retrieve all records from Mongo and map each record to it's model field value.
-      this.collection.find(filter).toArray().then((records) => {
-        records.forEach((doc) => {
-          if (doc.field && doc.hasOwnProperty('value') && this.store.has(doc.field)) {
-            this.store.setSilent(doc.field, doc.value)
-          } else if (doc.field) {
-            console.log(this.store.idAttribute === doc.field)
-            console.warn(doc.field + ' is an unrecognized data field.')
-          }
+      this.collection.findOne(NGN.coalesce(filter, {}))
+        .then((doc) => {
+          let tasks = new TaskRunner()
+
+          this.store.relationships.forEach((field) => {
+            tasks.add((next) => {
+              this.getRelatedModelData(field, this.store[field], doc[field], (data) => {
+                for (let index in doc[field]) {
+                  doc[field][index] = data[doc[field][index]]
+                }
+                next()
+              })
+            })
+          })
+
+          tasks.on('complete', () => {
+            console.log(JSON.stringify(doc, null, 2))
+            console.log('THIS IS WHERE THE DATA MODEL CAN BE LOADED.')
+          })
+
+          tasks.run(true)
+        })
+    }
+  }
+
+  getRelatedModelData (coll, model, referenceData, callback) {
+    referenceData = NGN.typeof(referenceData) === 'array' ? referenceData : [referenceData]
+    this._db.collection(coll).find({
+      _id: {
+        $in: referenceData
+      }
+    }).toArray().then((docs) => {
+      if (model instanceof NGN.DATA.Store) {
+        model = new model.model()
+      }
+
+      let tasks = new TaskRunner()
+
+      docs.forEach((doc) => {
+        model.relationships.forEach((field) => {
+          tasks.add((next) => {
+            this.getRelatedModelData(field, model[field], doc[field], (data) => {
+              for (let index in doc[field]) {
+                doc[field][index] = data[doc[field][index]]
+              }
+
+              next()
+            })
+          })
+        })
+      })
+
+      tasks.on('complete', () => {
+        let uniqueData = {}
+        docs.forEach((doc) => {
+          uniqueData[doc._id] = doc
         })
 
-        this.store.setUnmodified()
-
-        this.postfetch(callback)
+        callback(uniqueData)
       })
-    }
+
+      tasks.run(true)
+    })
   }
 
   /**
@@ -637,68 +938,102 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
 
   /**
    * @method updateModelRecord
-   * A private helper method for persisting a record upsert.
-   * @returns {function}
-   * Returns an event handler that accepts a `change` object from the
-   * NGN.DATA.Model instance (#store).
+   * A private helper method for persisting a record via upsert.
+   * @param {Object} change
+   * The change event delivered by the NGN.DATA.Model update event.
    * @private
    */
-  updateModelRecord () {
-    return (change) => {
-      let field = this.store.getDataField(change.field)
-      let value = change.new
+  upsertModelRecord (change) {
+    let field = this.store.getDataField(change.field)
+    let value = change.new
 
-      if (change.action === 'create') {
-        if (!field.required && change.new === null) {
-          return this.postop()
-        }
-
-        value = NGN.coalesce(change.new, this.store[change.field], field.required === true ? field.default : null)
-      } else if (change.join) {
-        value = change.originalEvent.record.data
+    if (change.action === 'create') {
+      if (!field.required && change.new === null) {
+        return this.postop()
       }
 
-      this.preconnect(() => {
-        this.collection.findOneAndUpdate({
-          field: change.field.split('.')[0]
-        }, {
-          field: change.field.split('.')[0],
-          value: value
-        }, {
-          upsert: true
-        }).then(() => {
-          this.postop(() => {
-            this.emit('live.' + change.action, change)
-            this.store.emit('live.' + change.action, change)
-          })
-        }).catch((e) => {
-          console.log('ERR', e)
+      value = NGN.coalesce(change.new, this.store[change.field], field.required === true ? field.default : null)
+    } else if (change.join) {
+      value = change.originalEvent.record.data
+    }
+
+    this.preconnect(() => {
+      this.collection.findOneAndUpdate({
+        field: change.field.split('.')[0]
+      }, {
+        field: change.field.split('.')[0],
+        value: value
+      }, {
+        upsert: true
+      }).then(() => {
+        this.postop(() => {
+          this.emit('live.' + change.action, change)
+          this.store.emit('live.' + change.action, change)
         })
+      }).catch((e) => {
+        console.log('ERR', e)
       })
+    })
+  }
+
+  /**
+   * @method createModelRecord
+   * A private helper method for persisting new NGN.DATA.Model records via upsert.
+   * @private
+   */
+  createModelRecord (record) {
+    if (this.fieldAsRecord) {
+      this.proxy.upsertModelRecord(record)
+    } else {
+      console.log('CREATE')
+      this.proxy.upsertStoreRecord(this.store, 'create')
     }
   }
 
   /**
-   * @method removeModelRecord
-   * Removes a model-driven record based on a specified key.
-   * @returns {function}
-   * Returns an event handler that accepts a `change` object from the
-   * NGN.DATA.Model instance (#store).
+   * @method createModelRecord
+   * A private helper method for persisting NGN.DATA.Model record modifications
+   * via upsert.
    * @private
    */
-  removeModelRecord () {
-    return (change) => {
-      this.preconnect(() => {
-        this.collection.findOneAndDelete({
-          field: change.field
-        }).then(() => {
-          this.postop(() => {
-            this.emit('live.delete', change)
-            this.store.emit('live.delete', change)
-          })
+  updateModelRecord (change) {
+    if (this.fieldAsRecord) {
+      this.proxy.upsertModelRecord(change)
+    } else {
+      console.log('UPDATE')
+      this.proxy.upsertStoreRecord(this.store, 'update')
+    }
+  }
+
+  /**
+   * @method deleteModelRecord
+   * Removes a model-driven record based on a specified key.
+   * @param {Object} change
+   * The change event delivered by the NGN.DATA.Model `field.delete` event.
+   * @private
+   */
+  removeModelRecord (change) {
+    this.preconnect(() => {
+      this.collection.findOneAndDelete({
+        field: change.field
+      }).then(() => {
+        this.postop(() => {
+          this.emit('live.delete', change)
+          this.store.emit('live.delete', change)
         })
       })
-    }
+    })
+  }
+
+  /**
+   * @method deleteModelRecord
+   * Removed a model-driven record from Mongo.
+   * @param {Object} change
+   * The change event delivered by the NGN.DATA.Model `field.delete` event.
+   * @private
+   */
+  deleteModelRecord (change) {
+    this.proxy.removeModelRecord(change)
   }
 
   /**
@@ -709,100 +1044,107 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    * NGN.DATA.Model instance (#store).
    * @private
    */
-  updateStoreRecord (eventName) {
-    return (record) => {
-      this.preconnect(() => {
-        record.setSilent('__mongoid', NGN.coalesce(record.__mongoid, this.createId()).toString())
+  upsertStoreRecord (record, eventName) {
+    console.log('UPSERTING STORE RECORD')
+    this.preconnect(() => {
+      record.setSilent('__mongoid', NGN.coalesce(record.__mongoid, this.createId()).toString())
 
-        this.collection.findOneAndUpdate({
-          _id: this.createId(record.__mongoid)
-        }, record.data, {
-          upsert: true
-        }).then(() => {
-          this.postop(() => {
-            this.emit('live.' + eventName, record)
-            this.store.emit('live.' + eventName, record)
-          })
+      this.collection.findOneAndUpdate({
+        _id: this.createId(record.__mongoid)
+      }, record.data, {
+        upsert: true
+      }).then(() => {
+        this.postop(() => {
+          this.emit('live.' + eventName, record)
+          this.store.emit('live.' + eventName, record)
+        })
+      }).catch((e) => {
+        this.postop(() => {
+          console.error(e)
         })
       })
-    }
+    })
+  }
+
+  /**
+   * @method createStoreRecord
+   * A private helper method for persisting a record upsert.
+   * @param {NGN.DATA.Model} record
+   * The model of the record to update.
+   * @private
+   */
+  createStoreRecord (record) {
+    this.proxy.upsertStoreRecord(record, 'create')
+  }
+
+  /**
+   * @method updateStoreRecord
+   * A private helper method for persisting a record upsert.
+   * @param {NGN.DATA.Model} record
+   * The model of the record to create.
+   * @private
+   */
+  updateStoreRecord (record) {
+    this.proxy.upsertStoreRecord(record, 'update')
   }
 
   /**
    * @method removeStoreRecord
    * Removes a store-driven record based on a specified key.
+   * @param {NGN.DATA.Model} record
+   * The model of the record to update.
+   * @private
+   */
+  removeStoreRecord (record) {
+    this.preconnect(() => {
+      this.collection.findOneAndDelete({
+        _id: record.__mongoid
+      }).then(() => {
+        this.postop(() => {
+          this.emit('live.delete', record)
+          this.store.emit('live.delete', record)
+        })
+      })
+    })
+  }
+
+  /**
+   * @method deleteStoreRecord
+   * A private helper method for removing a record.
+   * @param {NGN.DATA.Model} record
+   * The model of the record to remove.
+   * @private
+   */
+  deleteStoreRecord (record) {
+    this.proxy.removeStoreRecord(record)
+  }
+
+  /**
+   * @method clearStoreRecords
+   * Removes a store-driven records.
    * @returns {function}
    * Returns an event handler that accepts a `record` object from the
    * NGN.DATA.Model instance (#store).
    * @private
    */
-  removeStoreRecord () {
-    return (record) => {
-      this.preconnect(() => {
-        this.collection.findOneAndDelete({
-          _id: record.__mongoid
-        }).then(() => {
-          this.postop(() => {
-            this.emit('live.delete', record)
-            this.store.emit('live.delete', record)
-          })
+  clearAllStoreRecords () {
+    this.collection.deleteMany({
+      _id: {
+        $in: this._livetrack.map((id) => {
+          return this.createId(id)
         })
+      }
+    }).then(() => {
+      this.postop(() => {
+        this.emit('live.delete', null)
+        this.store.emit('live.delete', null)
       })
-    }
+    })
   }
 
-  /**
-   * @method enableLiveSync
-   * Live synchronization monitors the dataset for changes and immediately
-   * commits them to the data storage system.
-   * @fires live.create
-   * Triggered when a new record is persisted to the data store.
-   * @fires live.update
-   * Triggered when a record modification is persisted to the data store.
-   * @fires live.delete
-   * Triggered when a record is removed from the data store.
-   */
-  enableLiveSync () {
-    if (this.liveSyncEnabled) {
-      return
-    }
-
-    if (!this.pooled) {
-      console.warn('Connection pooling automatically enabled for live sync (originally disabled).')
-      this.pooled = true
-    }
-
-    this.liveSyncEnabled = true
-
-    if (this.type === 'model') {
-      // Create & Update Handlers
-      this.store.on('field.create', this.updateModelRecord())
-      this.store.on('field.update', this.updateModelRecord())
-      this.store.on('field.remove', this.removeModelRecord())
-      this.store.on('relationship.remove', this.removeModelRecord())
-      // relationship.create is unncessary because no data is available
-      // when a relationship is created. All related data will trigger a
-      // `field.update` event.
-    } else {
-      this.store.on('record.create', this.updateStoreRecord('create'))
-      this.store.on('record.update', this.updateStoreRecord('update'))
-      this.store.on('record.restored', this.updateStoreRecord('create'))
-      this.store.on('record.delete', this.removeStoreRecord())
-      this.store.on('clear', () => {
-        this.collection.deleteMany({
-          _id: {
-            $in: this._livetrack.map((id) => {
-              return this.createId(id)
-            })
-          }
-        }).then(() => {
-          this.postop(() => {
-            this.emit('live.delete', null)
-            this.store.emit('live.delete', null)
-          })
-        })
-      })
-    }
+  // Proxy the method.
+  clearStoreRecords () {
+    this.proxy.clearAllStoreRecords()
   }
 }
 

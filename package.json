@@ -29,7 +29,7 @@
   "homepage": "https://github.com/ngnjs/ngnx-data-proxy-mongo#readme",
   "dependencies": {
     "mongodb": "^2.2.24",
-    "ngnx-data-proxy-database": "^1.0.3",
+    "ngnx-data-proxy-database": "^1.0.4",
     "shortbus": "^1.2.7"
   },
   "devDependencies": {

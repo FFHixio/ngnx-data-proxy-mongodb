@@ -266,8 +266,8 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    * The full connection string.
    */
   get connectionString () {
-    let creds = this._credential
-    return `mongodb://${this.user}:${creds.replace(/./gi, '*')}@${this.host}:${this.port.toString()}/${this.db}`
+    // let creds = this._credential
+    return `mongodb://${this.user}:********@${this.host}:${this.port.toString()}/${this.db}`
   }
 
   /**
@@ -280,7 +280,7 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
 
   get poolId () {
     if (this._poolid === null) {
-      this._poolid = NGN.DATA.util.checksum(this.connectionString)
+      this._poolid = NGN.DATA.util.checksum(this._connstring)
     }
 
     return this._poolid

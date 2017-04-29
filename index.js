@@ -18,6 +18,8 @@ const TaskRunner = require('shortbus')
  * Fired when the collection attribute is changed. Handler
  * methods will receive an object with an `old` and `new`
  * key, each containing the old/new collection name.
+ * @fires connecting
+ * Triggered when the connection process is initiated.
  */
 class MongoProxy extends NGNX.DATA.DatabaseProxy {
   /**
@@ -150,6 +152,8 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
 
       _disconnecting: NGN.private(false),
 
+      _connecting: NGN.private(false),
+
       _db: NGN.private(null),
 
       /**
@@ -183,10 +187,12 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
     this.pool({
       connected: () => {
         this._connected = true
+        this._connecting = false
       },
 
       disconnected: () => {
         this._connected = false
+        this._connecting = false
 
         if (this._disconnecting) {
           this._disconnecting = false
@@ -197,6 +203,10 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
             NGN.DATA.ConnectionPool.unregisterClient(this.poolId, this.id)
           }
         }
+      },
+
+      connecting: () => {
+        this._connecting = true
       },
 
       livesync: {
@@ -276,6 +286,14 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    */
   get connected () {
     return this._connected
+  }
+
+  /**
+   * @property {boolean} connecting
+   * Indicates a connection is currently being established to the Mongo #host.
+   */
+  get connecting () {
+    return this._connecting
   }
 
   get poolId () {
@@ -364,9 +382,11 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    * Connect to the remote database.
    */
   connect () {
-    if (this.connected) {
+    if (this.connected || this.connecting) {
       return
     }
+
+    this.emit('connecting')
 
     let poolconn = false
 
@@ -375,7 +395,6 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
 
       // If a connection is already established, use it
       // instead of creating a new one.
-console.log(this.poolId)
       if (NGN.DATA.ConnectionPool.hasOwnProperty(this.poolId)) {
         this._db = NGN.DATA.ConnectionPool[this.poolId]
         this._db.on('reconnect', () => this.emit('reconnected'))
@@ -460,7 +479,10 @@ console.log(this.poolId)
     }
 
     this.once('connected', callback)
-    this.connect()
+
+    if (!this.connecting) {
+      this.connect()
+    }
   }
 
   /**

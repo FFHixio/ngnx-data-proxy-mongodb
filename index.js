@@ -745,7 +745,13 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
               }
 
               Object.keys(query).forEach((coll) => {
-                this._db.collection(coll).bulkWrite(query[coll]).then(next).catch((e) => {
+                this._db.collection(coll).bulkWrite(query[coll]).then(function (response) {
+                  if (response.hasWriteErrors()) {
+                    SaveError = new Error(response.getWriteErrors()[0].errmsg)
+                  }
+
+                  next()
+                }).catch((e) => {
                   SaveError = e
                   next()
                 })
@@ -772,7 +778,13 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
           return next()
         }
 
-        this.collection.bulkWrite(operations).then(next).catch((e) => {
+        this.collection.bulkWrite(operations).then(function (response) {
+          if (response.hasWriteErrors()) {
+            SaveError = new Error(response.getWriteErrors()[0].errmsg)
+          }
+
+          next()
+        }).catch((e) => {
           SaveError = e
           next()
         })
@@ -816,7 +828,13 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
 
             Object.keys(query).forEach((coll) => {
               tasks.add((more) => {
-                this._db.collection(coll).bulkWrite(query[coll]).then(more).catch((e) => {
+                this._db.collection(coll).bulkWrite(query[coll]).then(function (response) {
+                  if (response.hasWriteErrors()) {
+                    SaveError = new Error(response.getWriteErrors()[0].errmsg)
+                  }
+
+                  more()
+                }).catch((e) => {
                   SaveError = e
                   more()
                 })
@@ -833,7 +851,13 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
                 update: this.store.data,
                 upsert: true
               }
-            }]).then(next).catch((e) => {
+            }]).then(function (response) {
+              if (response.hasWriteErrors()) {
+                SaveError = new Error(response.getWriteErrors()[0].errmsg)
+              }
+
+              next()
+            }).catch((e) => {
               SaveError = e
               next()
             })

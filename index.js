@@ -859,7 +859,9 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
         return
       }
 
-      this.collection.bulkWrite(operations).then(() => this.postsave(callback))
+      this.collection.bulkWrite(operations)
+        .then(() => this.postsave(callback))
+        .catch((e) => console.log(e))
     }
   }
 

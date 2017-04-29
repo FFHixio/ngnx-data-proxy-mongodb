@@ -709,6 +709,8 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    * Fired after the save is complete.
    */
   save (callback) {
+    let SaveError = null
+
     if (this.type === 'store') {
       // Persist all new and modified records.
       this.store.addFilter((record) => {
@@ -744,7 +746,8 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
 
               Object.keys(query).forEach((coll) => {
                 this._db.collection(coll).bulkWrite(query[coll]).then(next).catch((e) => {
-                  throw e
+                  SaveError = e
+                  next()
                 })
               })
             })
@@ -770,13 +773,20 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
         }
 
         this.collection.bulkWrite(operations).then(next).catch((e) => {
-          throw e
+          SaveError = e
+          next()
         })
       })
 
       tasks.on('complete', () => {
         this.store.clearFilters()
-        this.postsave(callback)
+        if (SaveError !== null) {
+          this.postsave(() => {
+            callback(SaveError)
+          })
+        } else {
+          this.postsave(callback)
+        }
       })
 
       tasks.run(true)
@@ -807,7 +817,8 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
             Object.keys(query).forEach((coll) => {
               tasks.add((more) => {
                 this._db.collection(coll).bulkWrite(query[coll]).then(more).catch((e) => {
-                  throw e
+                  SaveError = e
+                  more()
                 })
               })
             })
@@ -823,13 +834,19 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
                 upsert: true
               }
             }]).then(next).catch((e) => {
-              console.error(e)
+              SaveError = e
               next()
             })
           })
         }
 
         tasks.on('complete', () => {
+          if (SaveError !== null) {
+            return this.postsave(() => {
+              callback(SaveError)
+            })
+          }
+
           this.postsave(callback)
         })
 
@@ -861,7 +878,11 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
 
       this.collection.bulkWrite(operations)
         .then(() => this.postsave(callback))
-        .catch((e) => console.log(e))
+        .catch((e) => {
+          this.postsave(() => {
+            callback(e)
+          })
+        })
     }
   }
 

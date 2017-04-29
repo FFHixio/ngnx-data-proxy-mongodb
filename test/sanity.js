@@ -91,10 +91,9 @@ let createPetSet = function () {
 }
 
 const clearDB = function (callback) {
+  proxyConfig.poolconnections = false
   let proxy = new NGNX.DATA.MongoDBProxy(proxyConfig)
-  proxy.destroy(() => {
-    callback()
-  })
+  proxy.destroy(callback)
 }
 
 test('Primary Namespace', function (t) {
@@ -295,115 +294,7 @@ test('Non-String Primitive Data Types', function (t) {
   })
 })
 
-test('Live Sync Model', function (t) {
-  clearDB(() => {
-    let Pet = new NGN.DATA.Model({
-      fields: {
-        name: null,
-        breed: null
-      }
-    })
-
-    let m = meta()
-
-    m.relationships = {
-      pet: Pet
-    }
-
-    proxyConfig.poolconnections = true
-    m.proxy = new NGNX.DATA.MongoDBProxy(proxyConfig)
-
-    let TempDataRecord = new NGN.DATA.Model(m)
-    let record = new TempDataRecord({
-      firstname: 'The',
-      lastname: 'Doctor',
-      pet: {
-        name: 'K-9',
-        breed: 'Robodog'
-      }
-    })
-
-    record.proxy.save(() => {
-      record.proxy.enableLiveSync()
-      let tasks = new TaskRunner()
-
-      tasks.add((next) => {
-        record.proxy.once('live.update', () => {
-          t.pass('live.update method detected.')
-          record.setSilent('firstname', 'Bubba')
-
-          record.proxy.fetch(() => {
-            t.ok(record.firstname === 'Da', 'Persisted correct value.')
-            next()
-          })
-        })
-
-        record.firstname = 'Da'
-      })
-
-      tasks.add((next) => {
-        record.once('live.create', () => {
-          t.pass('live.create triggered on new field creation.')
-          record.proxy.fetch(() => {
-            t.ok(record.hasOwnProperty('middlename') && record.middlename === 'Alonsi', 'Field creation persisted on the fly.')
-            next()
-          })
-        })
-
-        record.addField('middlename', {
-          type: String,
-          default: 'Alonsi',
-          required: true
-        })
-      })
-
-      tasks.add((next) => {
-        record.once('live.delete', () => {
-          t.pass('live.delete triggered on new field creation.')
-          t.ok(!record.hasOwnProperty('middlename'), 'Field deletion persisted on the fly.')
-          next()
-        })
-
-        record.removeField('middlename')
-      })
-
-      tasks.add((next) => {
-        record.once('live.update', () => {
-          t.pass('live.update triggered when new relationship is available.')
-
-          record.vehicle.setSilent('type', 'other')
-
-          record.proxy.fetch(() => {
-            t.ok(record.vehicle.type === 'Tardis', 'Proper value persisted in nested model.')
-            next()
-          })
-        })
-
-        let Vehicle = new NGN.DATA.Model({
-          fields: {
-            type: null,
-            doors: Number
-          }
-        })
-
-        record.on('relationship.create', () => {
-          record.vehicle.type = 'Tardis'
-        })
-
-        record.addRelationshipField('vehicle', Vehicle)
-      })
-
-      tasks.on('complete', () => {
-        record.proxy.once('disconnected', () => t.end())
-        record.proxy.disconnect()
-      })
-
-      tasks.run(true)
-    })
-  })
-})
-
-test('Live Sync Store', function (t) {
+test('Restoring Soft Delete Records', function (t) {
   clearDB(() => {
     let Person = new NGN.DATA.Model({
       fields: {
@@ -414,173 +305,52 @@ test('Live Sync Store', function (t) {
 
     let People = new NGN.DATA.Store({
       model: Person,
-      proxy: new NGNX.DATA.MongoDBProxy(proxyConfig)
+      proxy: new NGNX.DATA.MongoDBProxy(proxyConfig),
+      softDelete: true,
+      softDeleteTtl: 2000
     })
 
-    People.proxy.enableLiveSync()
+    People.once('load', () => {
+      People.once('save', () => {
+        People.proxy.enableLiveSync()
 
-    let tasks = new TaskRunner()
+        People.once('live.delete', (record) => {
+          People.proxy.collection.count({}).then((count) => {
+            t.ok(count === People.recordCount, 'Mongo contains the proper number of records.')
 
-    tasks.add((next) => {
-      People.once('live.create', (record) => {
-        t.ok(People.first.lastname === record.lastname, 'Persisted record and local record are equivalent.')
-        t.ok(record.firstname === 'The' && record.lastname === 'Doctor', 'Correct values stored for first record.')
+            People.once('live.create', (newRecord) => {
+              People.proxy.collection.count({}).then((count) => {
+                t.ok(count === People.recordCount && People.recordCount === 2, 'Data store restoration process persists proper number of records to disk.')
+                clearDB(() => {
+                  People.proxy.once('disconnected', () => {
+                    t.end()
+                  })
 
-        next()
-      })
+                  People.proxy.disconnect()
+                })
+              })
+            })
 
-      People.add({
-        firstname: 'The',
-        lastname: 'Doctor'
-      })
-    })
-
-    tasks.add((next) => {
-      People.once('live.create', (record) => {
-        t.ok(record.firstname === 'The' && record.lastname === 'Master', 'Correct values stored for multiple records.')
-
-        next()
-      })
-
-      People.add({
-        firstname: 'The',
-        lastname: 'Master'
-      })
-    })
-
-    tasks.add((next) => {
-      People.once('live.update', (record) => {
-        t.ok(record.firstname === 'Da' && record.lastname === 'Master', 'Correct record and value written during update.')
-
-        next()
-      })
-
-      People.last.firstname = 'Da'
-    })
-
-    tasks.add((next) => {
-      People.once('live.delete', (record) => {
-        People.proxy.collection.count({
-          _id: record.__mongoid
-        }).then((count) => {
-          t.ok(count === 0, 'Deleted record does not exist in the database.')
-          next()
-        })
-      })
-
-      People.remove(People.first)
-    })
-
-    tasks.add((next) => {
-      People.on('live.delete', () => {
-        People.proxy.collection.count({}).then((count) => {
-          t.ok(count === 0, 'Cleared record does not exist in the database.')
-          next()
-        })
-      })
-
-      People.clear()
-    })
-
-    tasks.on('complete', () => {
-      clearDB(() => {
-        People.proxy.once('disconnected', () => {
-          t.end()
+            People.restore(record.checksum)
+          }).catch((e) => console.log(e))
         })
 
-        People.proxy.disconnect()
+        People.remove(1)
       })
+
+      People.proxy.save()
     })
 
-    tasks.run(true)
+    People.load([{
+      firstname: 'The',
+      lastname: 'Doctor'
+    }, {
+      firstname: 'The',
+      lastname: 'Master'
+    }])
   })
 })
 
-// test('Restoring Soft Delete Records', function (t) {
-//   clearDB(() => {
-//     let Person = new NGN.DATA.Model({
-//       fields: {
-//         firstname: null,
-//         lastname: null
-//       }
-//     })
-//
-//     let People = new NGN.DATA.Store({
-//       model: Person,
-//       proxy: new NGNX.DATA.MongoDBProxy(proxyConfig),
-//       softDelete: true,
-//       softDeleteTtl: 2000
-//     })
-//
-//     People.once('load', () => {
-//       People.once('save', () => {
-//         People.proxy.enableLiveSync()
-//
-//         People.once('live.delete', (record) => {
-//           People.proxy.collection.count({}).then((count) => {
-//             t.ok(count === People.recordCount, 'Mongo contains the proper number of records.')
-//
-//             People.once('live.create', (newRecord) => {
-//               People.proxy.collection.count({}).then((count) => {
-//                 t.ok(count === People.recordCount && People.recordCount === 2, 'Data store restoration process persists proper number of records to disk.')
-//                 clearDB(() => {
-//                   People.proxy.once('disconnected', () => {
-//                     t.end()
-//                   })
-//
-//                   People.proxy.disconnect()
-//                 })
-//               })
-//             })
-//
-//             People.restore(record.checksum)
-//           })
-//         })
-//
-//         People.remove(1)
-//       })
-//
-//       People.proxy.save()
-//     })
-//
-//     People.load([{
-//       firstname: 'The',
-//       lastname: 'Doctor'
-//     }, {
-//       firstname: 'The',
-//       lastname: 'Master'
-//     }])
-//   })
-// })
-//
-// test('Save and Fetch Model as Single Record', (t) => {
-//   proxyConfig.fieldAsRecord = true
-//
-//   let Person = new NGN.DATA.Model({
-//     fields: {
-//       firstname: null,
-//       lastname: null
-//     },
-//     proxy: new NGNX.DATA.MongoDBProxy(proxyConfig)
-//   })
-//
-//   let p = new Person({
-//     firstname: 'Rose',
-//     lastname: 'Tyler'
-//   })
-//
-//   clearDB(() => {
-//     p.save(() => {
-//       p.firstname = 'Bob'
-//
-//       p.fetch(() => {
-//         t.ok(p.firstname === 'Rose', 'Saved/fetched model as a single record.')
-//         t.end()
-//       })
-//     })
-//   })
-// })
-//
 // test('Expand nested objects to independent collections', function (t) {
 //   proxyConfig.fieldAsRecord = false
 //   proxyConfig.expandRelationships = true
@@ -608,6 +378,7 @@ test('Live Sync Store', function (t) {
 //     }
 //   })
 //
+//   proxyConfig.poolconnections = false
 //   let Person = new NGN.DATA.Model({
 //     fields: {
 //       firstname: null,
@@ -659,9 +430,209 @@ test('Live Sync Store', function (t) {
 //         t.ok(p.pets.last.toys.recordCount === 2, 'Multiple layers of nesting retrieved from multiple collections.')
 //         t.ok(p.pets.last.toys.first.name === 'Odie', 'Multiple layers of nesting returned accurate data from multiple collections.')
 //
-//         p.proxy.once('disconnect', () => t.end())
-//         p.proxy.disconnect()
+//         t.end()
 //       })
 //     })
 //   })
 // })
+
+// Error.stackTraceLimit = Infinity
+test('Live Sync Model', function (t) {
+  clearDB(() => {
+    let Pet = new NGN.DATA.Model({
+      fields: {
+        name: null,
+        breed: null
+      }
+    })
+
+    let m = meta()
+
+    m.relationships = {
+      pet: Pet
+    }
+
+    proxyConfig.poolconnections = true
+    m.proxy = new NGNX.DATA.MongoDBProxy(proxyConfig)
+
+    let TempDataRecord = new NGN.DATA.Model(m)
+    let record = new TempDataRecord({
+      firstname: 'The',
+      lastname: 'Doctor',
+      pet: {
+        name: 'K-9',
+        breed: 'Robodog'
+      }
+    })
+
+    record.proxy.save(() => {
+      record.proxy.enableLiveSync()
+      let tasks = new TaskRunner()
+
+      tasks.add((next) => {
+        record.proxy.once('live.update', () => {
+          t.pass('live.update method detected.')
+
+          record.setSilent('firstname', 'Bubba')
+
+          record.proxy.fetch(() => {
+            t.ok(record.firstname === 'Da', 'Persisted correct value.')
+            next()
+          })
+        })
+
+        record.firstname = 'Da'
+      })
+
+      tasks.add((next) => {
+        record.proxy.once('live.create', () => {
+          t.pass('live.create triggered on new field creation.')
+          record.proxy.fetch(() => {
+            t.ok(record.hasOwnProperty('middlename') && record.middlename === 'Alonsi', 'Field creation persisted on the fly.')
+            next()
+          })
+        })
+
+        record.addField('middlename', {
+          type: String,
+          default: 'Alonsi',
+          required: true
+        })
+      })
+
+      tasks.add((next) => {
+        record.proxy.once('live.delete', () => {
+          t.pass('live.delete triggered on new field creation.')
+          t.ok(!record.hasOwnProperty('middlename'), 'Field deletion persisted on the fly.')
+          next()
+        })
+
+        record.removeField('middlename')
+      })
+
+      tasks.add((next) => {
+        record.proxy.once('live.update', () => {
+          t.pass('live.update triggered when new relationship is available.')
+
+          record.vehicle.setSilent('type', 'other')
+
+          record.proxy.fetch(() => {
+            t.ok(record.vehicle.type === 'Tardis', 'Proper value persisted in nested model.')
+            next()
+          })
+        })
+
+        let Vehicle = new NGN.DATA.Model({
+          fields: {
+            type: null,
+            doors: Number
+          }
+        })
+
+        record.on('relationship.create', () => {
+          record.vehicle.type = 'Tardis'
+        })
+
+        record.addRelationshipField('vehicle', Vehicle)
+      })
+
+      tasks.on('complete', () => {
+        record.proxy.once('disconnected', () => t.end())
+        record.proxy.disconnect()
+      })
+
+      tasks.run(true)
+    })
+  })
+})
+
+test('Live Sync Store', function (t) {
+  clearDB(() => {
+    let Person = new NGN.DATA.Model({
+      fields: {
+        firstname: null,
+        lastname: null
+      }
+    })
+
+    proxyConfig.poolconnections = true
+    let People = new NGN.DATA.Store({
+      model: Person,
+      proxy: new NGNX.DATA.MongoDBProxy(proxyConfig)
+    })
+
+    People.proxy.enableLiveSync()
+
+    let tasks = new TaskRunner()
+
+    tasks.add((next) => {
+      People.proxy.once('live.create', (record) => {
+        t.ok(People.first.lastname === record.lastname, 'Persisted record and local record are equivalent.')
+        t.ok(record.firstname === 'The' && record.lastname === 'Doctor', 'Correct values stored for first record.')
+
+        next()
+      })
+
+      People.add({
+        firstname: 'The',
+        lastname: 'Doctor'
+      })
+    })
+
+    tasks.add((next) => {
+      People.proxy.once('live.create', (record) => {
+        t.ok(record.firstname === 'The' && record.lastname === 'Master', 'Correct values stored for multiple records.')
+
+        next()
+      })
+
+      People.add({
+        firstname: 'The',
+        lastname: 'Master'
+      })
+    })
+
+    tasks.add((next) => {
+      People.proxy.once('live.update', (record) => {
+        t.ok(record.firstname === 'Da' && record.lastname === 'Master', 'Correct record and value written during update.')
+
+        next()
+      })
+
+      People.last.firstname = 'Da'
+    })
+
+    tasks.add((next) => {
+      People.proxy.once('live.delete', (record) => {
+        People.proxy.collection.count({
+          _id: record.__mongoid
+        }).then((count) => {
+          t.ok(count === 0, 'Deleted record does not exist in the database.')
+          next()
+        })
+      })
+
+      People.remove(People.first)
+    })
+
+    tasks.add((next) => {
+      People.proxy.once('live.delete', () => {
+        People.proxy.collection.count({}).then((count) => {
+          t.ok(count === 0, 'Cleared record does not exist in the database.')
+          next()
+        })
+      })
+
+      People.clear()
+    })
+
+    tasks.on('complete', () => {
+      clearDB(() => {
+        People.proxy.once('disconnected', () => t.end())
+        People.proxy.disconnect()
+      })
+    })
+
+    tasks.run(true)
+  })
+})

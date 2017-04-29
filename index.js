@@ -93,8 +93,8 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
        */
       port: NGN.privateconst(parseInt(NGN.coalesce(
         cfg.port,
-        cfg.host.split(/[\:\\\/]/).length > 1
-          ? cfg.host.split(/[\:\\\/]/gi)[1]
+        cfg.host.split(/[\:\\\/]/).length > 1 // eslint-disable-line
+          ? cfg.host.split(/[\:\\\/]/gi)[1] // eslint-disable-line
           : null,
         27017), 10)),
 
@@ -132,9 +132,10 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
        * Pooling is recommended in most situations.
        */
       pooled: NGN.private(NGN.coalesce(cfg.poolconnections, true)),
+      _originalPooling: NGN.private(NGN.coalesce(cfg.poolconnections, true)),
 
       _connstring: NGN.get(() => {
-        return this.connectionString.replace(/\:\*{8}/gi, ':' + this._credential)
+        return this.connectionString.replace(/\:\*{1,100}/gi, ':' + this._credential) // eslint-disable-line
       }),
 
       raw: NGN.privateconst(require('mongodb')),
@@ -166,6 +167,8 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
 
       _livetrack: NGN.private([]),
 
+      _poolid: NGN.private(null),
+
       /**
        * @cfg {boolean} [fieldAsRecord=false]
        * When set to `true`, each field will be saved as it's own key/value
@@ -187,6 +190,23 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
 
         if (this._disconnecting) {
           this._disconnecting = false
+        }
+
+        if (this.pooled) {
+          if (NGN.DATA.ConnectionPool.clients.hasOwnProperty(this.poolId)) {
+            NGN.DATA.ConnectionPool.unregisterClient(this.poolId, this.id)
+          }
+        }
+      },
+
+      livesync: {
+        enabled: () => {
+          this._originalPooling = this.pooled
+          this.pooled = true
+        },
+
+        disabled: () => {
+          this.pooled = this._originalPooling
         }
       }
     })
@@ -217,7 +237,12 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    * @private
    */
   get collection () {
-    if (this._client && this._collection) {
+    if (!this.connected) {
+      NGN.BUS.emit('NGN.ADVISORY.WARN', 'Attempting to access MongoDB connection established while attempting to reference a collection.')
+      throw new Error('No connection established.')
+    }
+
+    if (this.client && this._collection) {
       return this._db.collection(this._collection)
     } else {
       return null
@@ -241,8 +266,8 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    * The full connection string.
    */
   get connectionString () {
-    return 'mongodb://' + this.user + ':********' + '@' +
-      this.host + ':' + this.port.toString() + '/' + this.db
+    let creds = this._credential
+    return `mongodb://${this.user}:${creds.replace(/./gi, '*')}@${this.host}:${this.port.toString()}/${this.db}`
   }
 
   /**
@@ -251,6 +276,14 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    */
   get connected () {
     return this._connected
+  }
+
+  get poolId () {
+    if (this._poolid === null) {
+      this._poolid = NGN.DATA.util.checksum(this.connectionString)
+    }
+
+    return this._poolid
   }
 
   extendModel (BaseModel) {
@@ -306,7 +339,6 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
       this.store.replaceModel(this.extendModel(this.store.model))
     } else if (!this.fieldAsRecord) {
       if (!this.store.has('__mongoid')) {
-        console.log('INIT SPECIAL', this.type)
         this.store.addMetaField('__mongoid')
       }
 
@@ -336,6 +368,24 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
       return
     }
 
+    let poolconn = false
+
+    if (this.pooled) {
+      poolconn = true
+
+      // If a connection is already established, use it
+      // instead of creating a new one.
+      if (NGN.DATA.ConnectionPool.clients.hasOwnProperty(this.poolId)) {
+        this._db = NGN.DATA.ConnectionPool[this.poolId]
+        this._db.on('reconnect', () => this.emit('reconnected'))
+        this._db.on('close', () => this.emit('disconnected'))
+
+        this.emit('connected')
+
+        return
+      }
+    }
+
     this.client.connect(this._connstring, {
       autoReconnect: this.autoreconnect
     }, (err, db) => {
@@ -343,13 +393,8 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
         throw err
       }
 
-      db.on('reconnect', () => {
-        this.emit('reconnected')
-      })
-
-      db.on('close', () => {
-        this.emit('disconnected')
-      })
+      db.on('reconnect', () => this.emit('reconnected'))
+      db.on('close', () => this.emit('disconnected'))
 
       this._heartbeat = setInterval(() => {
         db.collection('__DNE__').find({
@@ -359,6 +404,15 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
       }, this.heartbeatInterval)
 
       this._db = db
+
+      if (poolconn) {
+        NGN.DATA.ConnectionPool.add(this.poolId, db, (conn, done) => {
+          conn.once('close', done)
+          conn.close()
+        })
+
+        NGN.DATA.ConnectionPool.registerClient(this.poolId, this.id)
+      }
 
       this.emit('connected')
     })
@@ -379,7 +433,11 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
 
     this.liveSyncEnabled = false
 
-    this._db.close()
+    if (!this.pooled) {
+      this._db.close()
+    } else {
+      this.emit('disconnected')
+    }
   }
 
   /**
@@ -414,10 +472,7 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
   presave (callback) {
     // If there is no connection, attempt to establish one.
     if (!this.connected) {
-      this.preconnect(() => {
-        this.save.apply(this, arguments)
-      })
-
+      this.preconnect(() => this.save.apply(this, arguments))
       return false
     }
 
@@ -434,8 +489,7 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    */
   assureMongoIdAvailable (model) {
     if (model instanceof NGN.DATA.Store) {
-      console.warn('Cannot apply MongoID to a store.', model.data)
-      return
+      return NGN.BUS.emit('NGN.ADVISORY.WARN', `Cannot apply MongoID to a store: ${JSON.stringify(model.data, null, 2)}`)
     }
 
     // Assure a Mongo ID is available
@@ -458,7 +512,12 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
     this.assureMongoIdAvailable(model)
 
     // If no ID exists, make one.
-    model.__mongoid = NGN.coalesce(model.__mongoid, this.createId())
+    try {
+      model.__mongoid = NGN.coalesce(model.__mongoid, this.createId())
+    } catch (e) {
+      console.error(model.__mongoid)
+      throw e
+    }
   }
 
   /**
@@ -510,7 +569,7 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    *
    * ```js
    * {
-   *   colletion_a: [{
+   *   collection_a: [{
    *     updateOne: {
    *       filter: {
    *         _id: ObjectId('...')
@@ -527,7 +586,7 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    *       upsert: true
    *     }
    *   }],
-   *   colletion_b: [{
+   *   collection_b: [{
    *     updateOne: {
    *       filter: {
    *         _id: ObjectId('...')
@@ -544,7 +603,7 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    */
   flattenModelQuery (model, collection, callback) {
     if (model instanceof NGN.DATA.Store) {
-      console.warn('Cannot flatten a store.')
+      NGN.BUS.emit('NGN.ADVISORY.WARN', 'Cannot flatten a store.')
       return
     }
 
@@ -708,7 +767,6 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
       if (!this.presave(callback)) {
         return
       }
-
       // If the fields should be a single record,
       // save the entire model content as a single record.
       if (!this.fieldAsRecord) {
@@ -733,18 +791,24 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
           })
         } else {
           tasks.add((next) => {
-            this.collection.updateOne({
-              _id: this.store.__mongoid
-            }, this.store.data, {
-              upsert: true
-            }).then(next).catch((e) => {
+            this.collection.bulkWrite([{
+              updateOne: {
+                filter: {
+                  _id: this.store.__mongoid
+                },
+                update: this.store.data,
+                upsert: true
+              }
+            }]).then(next).catch((e) => {
               console.error(e)
               next()
             })
           })
         }
 
-        tasks.on('complete', () => this.postsave(callback))
+        tasks.on('complete', () => {
+          this.postsave(callback)
+        })
 
         return tasks.run(true)
       }
@@ -814,18 +878,18 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    * Returns true if it's safe continue the fetch operation.
    * @private
    */
-   prefetch (callback) {
-     // If there is no connection, attempt to establish one.
-     if (!this.connected) {
-       this.preconnect(() => {
-         this.fetch.apply(this, arguments)
-       })
+  prefetch (callback) {
+    // If there is no connection, attempt to establish one.
+    if (!this.connected) {
+      this.preconnect(() => {
+        this.fetch.apply(this, arguments)
+      })
 
-       return false
-     }
+      return false
+    }
 
-     return true
-   }
+    return true
+  }
 
   /**
    * @method fetch
@@ -839,14 +903,12 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
    * Fired after the fetch and parse is complete.
    */
   fetch (filter, callback) {
-console.log('1. Fetch Called')
     if (NGN.isFn(filter)) {
       callback = filter
       filter = {}
     }
 
     if (this.type === 'store') {
-console.log('2. Model is a store')
       // Persist all new and modified records.
       this.store.addFilter((record) => {
         return record.isNew || record.modified
@@ -863,41 +925,45 @@ console.log('2. Model is a store')
         this.store.clearFilters()
         return
       }
-console.log('3. Getting data')
+
       this.collection.find(filter).toArray().then((records) => {
         this.store.once('reload', () => {
           this.store.clearFilters()
           this.postfetch(callback)
         })
-console.log(records)
+
         this.store.reload(records)
       })
     } else {
-console.log('2. Fetch identified as a model.')
       // Make sure there's something to update.
       if (!this.store.isNew && !this.store.modified) {
-console.log('3. Fetch recognized something not new and unmodified. Aborting.')
         return this.postfetch(callback)
       }
 
       // Run pre-fetch checks
       if (!this.prefetch(callback)) {
-console.log('XXX> Prefetch failed.')
         return
       }
-console.log('4. Check collection')
+
       this.collection.findOne(NGN.coalesce(filter, {}))
         .then((doc) => {
-console.log('5. Results Retrieved', doc)
           let tasks = new TaskRunner()
 
           if (this.expandRelationships) {
             this.store.relationships.forEach((field) => {
               tasks.add((next) => {
                 this.getRelatedModelData(field, this.store[field], doc[field], (data) => {
-                  for (let index in doc[field]) {
-                    doc[field][index] = data[doc[field][index]]
-                  }
+                  Object.keys(doc[field]).forEach((attr) => {
+                    let value = data[doc[field][attr]] instanceof Buffer ? data[doc[field][attr]].toString() : data[doc[field][attr]]
+
+                    if (value !== undefined) {
+                      doc[field][attr] = value
+                    } else {
+                      if (attr === 'id') {
+                        NGN.BUS.emit('NGN.ADVISORY.WARN', 'Fetching expanded nested MongoDB objects stored in independent collections is not supported (pseudo-cartesian join).')
+                      }
+                    }
+                  })
 
                   next()
                 })
@@ -906,24 +972,20 @@ console.log('5. Results Retrieved', doc)
           }
 
           tasks.on('complete', () => {
-console.log('6. Fetch complete. Now populating with...', doc)
             this.assureModelReady(this.store)
-
-            this.store.on('load', () => console.log('7. Load recognized'))
             this.store.once('load', () => this.postfetch(callback))
-
             this.store.load(doc)
           })
 
           tasks.run(true)
         })
+        .catch((e) => console.error(e))
     }
   }
 
   getRelatedModelData (coll, model, referenceData, callback) {
-console.log('GET DATA FOR COLLECTION:', coll)
     referenceData = NGN.typeof(referenceData) === 'array' ? referenceData : [referenceData]
-console.log('REFERENCE DATA', referenceData)
+
     this._db.collection(coll).find({
       _id: {
         $in: referenceData
@@ -1079,9 +1141,7 @@ console.log('REFERENCE DATA', referenceData)
           this.emit('live.' + change.action, change)
           this.store.emit('live.' + change.action, change)
         })
-      }).catch((e) => {
-        console.log('ERR', e)
-      })
+      }).catch((e) => console.error(e))
     })
   }
 
@@ -1099,7 +1159,7 @@ console.log('REFERENCE DATA', referenceData)
   }
 
   /**
-   * @method createModelRecord
+   * @method updateModelRecord
    * A private helper method for persisting NGN.DATA.Model record modifications
    * via upsert.
    * @private
@@ -1161,10 +1221,7 @@ console.log('REFERENCE DATA', referenceData)
     }
 
     this.preconnect(() => {
-console.log('UPSERTING STORE RECORD')
-
       this.assureMongoId(record)
-console.log('YO', this.expandRelationships, record.__mongoid, record.data)
 
       let tasks = new TaskRunner()
       let data = record.data
@@ -1187,7 +1244,7 @@ console.log('YO', this.expandRelationships, record.__mongoid, record.data)
           })
         })
 
-        tasks.add((next) => {
+        tasks.add(() => {
           query[this._collection] = query[this._collection] || []
           query[this._collection].push({
             updateOne: {
@@ -1222,12 +1279,11 @@ console.log('YO', this.expandRelationships, record.__mongoid, record.data)
       }
 
       tasks.on('complete', () => {
-
         this.postop(() => {
-
-          this.emit('live.' + eventName, record)
-return console.log('live.' + eventName)
-          this.store.emit('live.' + eventName, record)
+          if (this.liveSyncEnabled) {
+            this.emit(`live.${eventName}`, record)
+            this.store.emit(`live.${eventName}`, record)
+          }
         })
       })
 
@@ -1253,8 +1309,10 @@ return console.log('live.' + eventName)
    * The model of the record to create.
    * @private
    */
-  updateStoreRecord (record) {
-    this.proxy.upsertStoreRecord(record, 'update')
+  updateStoreRecord (record, change) {
+    if (!record.hasMetaField(change.field)) {
+      this.proxy.upsertStoreRecord(record, 'update')
+    }
   }
 
   /**
@@ -1270,8 +1328,10 @@ return console.log('live.' + eventName)
         _id: record.__mongoid
       }).then(() => {
         this.postop(() => {
-          this.emit('live.delete', record)
-          this.store.emit('live.delete', record)
+          if (this.liveSyncEnabled) {
+            this.emit('live.delete', record)
+            this.store.emit('live.delete', record)
+          }
         })
       })
     })
@@ -1299,14 +1359,14 @@ return console.log('live.' + eventName)
   clearAllStoreRecords () {
     this.collection.deleteMany({
       _id: {
-        $in: this._livetrack.map((id) => {
-          return this.createId(id)
-        })
+        $in: this._livetrack
       }
     }).then(() => {
       this.postop(() => {
-        this.emit('live.delete', null)
-        this.store.emit('live.delete', null)
+        if (this.liveSyncEnabled) {
+          this.emit('live.delete', null)
+          this.store.emit('live.delete', null)
+        }
       })
     })
   }

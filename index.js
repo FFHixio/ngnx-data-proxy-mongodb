@@ -375,6 +375,7 @@ class MongoProxy extends NGNX.DATA.DatabaseProxy {
 
       // If a connection is already established, use it
       // instead of creating a new one.
+console.log(this.poolId)
       if (NGN.DATA.ConnectionPool.hasOwnProperty(this.poolId)) {
         this._db = NGN.DATA.ConnectionPool[this.poolId]
         this._db.on('reconnect', () => this.emit('reconnected'))

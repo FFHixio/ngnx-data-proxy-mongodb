@@ -35,7 +35,7 @@
   "devDependencies": {
     "musthave": "^1.0.2",
     "babel-eslint": "^7.2.3",
-    "fs-extra": "^2.1.2",
+    "fs-extra": "^3.0.0",
     "gulp": "^3.9.1",
     "gulp-header": "^1.8.8",
     "gulp-strip-comments": "^2.4.5",

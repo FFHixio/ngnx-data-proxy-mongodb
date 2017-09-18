@@ -1,6 +1,6 @@
 {
   "name": "ngnx-data-proxy-mongodb",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "Fetch and save data from a MongoDB.",
   "main": "index.js",
   "directories": {

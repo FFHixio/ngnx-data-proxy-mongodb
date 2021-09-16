@@ -41,8 +41,8 @@
     "gulp-strip-comments": "^2.4.5",
     "localenvironment": "^1.0.2",
     "ngn": "^0.3.30",
-    "snazzy": "^7.0.0",
-    "standard": "^10.0.2",
+    "snazzy": "^9.0.0",
+    "standard": "^14.3.2",
     "standard-tap": "^1.0.1",
     "tap-spec": "^4.1.1",
     "tape": "^4.6.3"
